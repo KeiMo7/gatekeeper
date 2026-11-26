@@ -18,6 +18,34 @@ webhooks:
   - v1beta1
   clientConfig:
     {{- if .Values.validatingWebhookURL }}
+    url: https://{{ .Values.validatingWebhookURL }}/v1/admit-template
+    {{- else }}
+    service:
+      name: gatekeeper-webhook-service
+      namespace: '{{ .Release.Namespace }}'
+      path: /v1/admit-template
+    {{- end }}
+  failurePolicy: {{ .Values.validatingWebhookTemplateFailurePolicy }}
+  matchPolicy: Exact
+  name: constrainttemplate-validation.gatekeeper.sh
+  rules:
+  - apiGroups:
+    - templates.gatekeeper.sh
+    apiVersions:
+    - '*'
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - constrainttemplates
+    scope: '*'
+  sideEffects: None
+  timeoutSeconds: 3
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    {{- if .Values.validatingWebhookURL }}
     url: https://{{ .Values.validatingWebhookURL }}/v1/admit
     {{- else }}
     service:

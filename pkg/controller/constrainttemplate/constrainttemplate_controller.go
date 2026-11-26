@@ -88,6 +88,23 @@ var gvkConstraintTemplate = schema.GroupVersionKind{
 	Kind:    "ConstraintTemplate",
 }
 
+func templateHasRegoEngine(ct *templates.ConstraintTemplate) bool {
+	if ct == nil {
+		return false
+	}
+	for _, target := range ct.Spec.Targets {
+		if strings.TrimSpace(target.Rego) != "" {
+			return true
+		}
+		for _, code := range target.Code {
+			if code.Engine == "Rego" || strings.EqualFold(code.Engine, "Rego") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type Adder struct {
 	CFClient           *constraintclient.Client
 	WatchManager       *watch.Manager
@@ -548,9 +565,40 @@ func (r *ReconcileConstraintTemplate) handleUpdate(
 		if err := r.metrics.reportIngestDuration(ctx, metrics.ErrorStatus, time.Since(beginCompile)); err != nil {
 			logger.Error(err, "failed to report constraint template ingestion duration")
 		}
-		err := r.reportErrorOnCTStatus(ctx, ErrIngestCode, "Could not ingest Rego", status, err)
+
+		failureClass := webhook.TemplateFailureClassInvalid
+		failureCode := webhook.TemplateInvalidRego
+		if celSchema.HasCELEngine(unversionedCT) && !templateHasRegoEngine(unversionedCT) {
+			failureCode = webhook.TemplateInvalidCEL
+		}
+		retryable := webhook.IsRetryableTemplateError(err) ||
+			errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded)
+		if retryable {
+			failureClass = webhook.TemplateFailureClassUnavailable
+			failureCode = webhook.TemplateBackendUnavailable
+		}
+		prefix := fmt.Sprintf("[%s/%s]", failureClass, failureCode)
+		status.Status.Errors = []*v1beta1.CreateCRDError{{
+			Code:    ErrIngestCode,
+			Message: fmt.Sprintf("%s Could not ingest Rego: %v", prefix, err),
+		}}
+
+		logger.WithValues(
+			"template_name", ct.GetName(),
+			"template_uid", ct.GetUID(),
+			"generation", ct.GetGeneration(),
+			"failure_class", failureClass,
+			"failure_code", failureCode,
+			"retryable", retryable,
+		).Error(err, "Could not ingest ConstraintTemplate")
+
 		r.tracker.TryCancelTemplate(unversionedCT) // Don't track templates that failed compilation
-		return reconcile.Result{}, err
+		if retryable {
+			return reconcile.Result{}, &reportedStatusError{err: err}
+		}
+		terminalErr := reconcile.TerminalError(err)
+		return reconcile.Result{}, &reportedStatusError{err: terminalErr}
 	}
 
 	if err := r.metrics.reportIngestDuration(ctx, metrics.ActiveStatus, time.Since(beginCompile)); err != nil {

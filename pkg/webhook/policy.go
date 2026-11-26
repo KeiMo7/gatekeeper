@@ -141,7 +141,8 @@ func AddPolicyWebhook(mgr manager.Manager, deps Dependencies) error {
 			eventRecorder:   recorder,
 			gkNamespace:     util.GetNamespace(),
 		},
-		log: log,
+		log:               log,
+		templateValidator: sharedTemplateAdmissionHandler(deps.OpaClient),
 	}
 	threadCount := *maxServingThreads
 	if threadCount < 1 {
@@ -164,6 +165,7 @@ type validationHandler struct {
 	emitAdmissionAuditAnnotations           bool
 	admissionAuditAnnotationsIncludeSuccess bool
 	semaphore                               chan struct{}
+	templateValidator                       *templateAdmissionHandler
 	log                                     logr.Logger
 }
 
@@ -177,6 +179,10 @@ func (h *validationHandler) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	if userErr, err := h.validateGatekeeperResources(ctx, &req); err != nil {
+		var templateFailure *TemplateValidationFailure
+		if errors.As(err, &templateFailure) && templateFailure.Class == TemplateFailureClassInvalid {
+			return templateFailureResponse(req.UID, templateFailure)
+		}
 		var code int32
 		if userErr {
 			code = http.StatusUnprocessableEntity
@@ -600,6 +606,34 @@ func (h *validationHandler) validateGatekeeperResources(ctx context.Context, req
 // The returned boolean is only true if error is non-nil and is a result of user
 // error.
 func (h *validationHandler) validateTemplate(ctx context.Context, req *admission.Request) (bool, error) {
+	// Deletion validation retains the historical CRD-only behavior so removing an
+	// invalid template is not made harder by the new compile gate.
+	if req.Operation == admissionv1.Delete {
+		return h.validateTemplateCRDOnly(ctx, req)
+	}
+
+	validator := h.templateValidator
+	if validator == nil {
+		validator = sharedTemplateAdmissionHandler(h.opa)
+	}
+	if h.opa != nil {
+		validator.crdMu.Lock()
+		if validator.crdGenerator == nil {
+			validator.opa = h.opa
+			validator.crdGenerator = h.opa
+		}
+		validator.crdMu.Unlock()
+	}
+
+	_, failure := validator.review(ctx, *req)
+	if failure == nil {
+		return false, nil
+	}
+	return failure.Class == TemplateFailureClassInvalid, failure
+}
+
+// validateTemplateCRDOnly preserves the pre-isolated-compilation Template check used by DELETE.
+func (h *validationHandler) validateTemplateCRDOnly(ctx context.Context, req *admission.Request) (bool, error) {
 	templ, _, err := deserializer.Decode(getReqObject(req), nil, nil)
 	if err != nil {
 		return false, err

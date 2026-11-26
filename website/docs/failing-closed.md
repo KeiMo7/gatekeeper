@@ -9,6 +9,19 @@ Currently Gatekeeper is defaulting to using `failurePolicy: Ignore` for admissio
 
 Here we discuss how to configure Gatekeeper to fail closed and some factors you may want to consider before doing so.
 
+## ConstraintTemplate Writes Fail Closed Separately
+
+The main `validation.gatekeeper.sh` webhook keeps its chart default `failurePolicy: Ignore` (`validatingWebhookFailurePolicy: Ignore`), so an unreachable Gatekeeper does not block ordinary resource creates and updates; audit remains the backstop.
+
+ConstraintTemplate writes are additionally validated before etcd persistence by the dedicated `constrainttemplate-validation.gatekeeper.sh` webhook at `/v1/admit-template`. Its chart default is `failurePolicy: Fail` (`validatingWebhookTemplateFailurePolicy: Fail`). Therefore:
+
+- A syntactically or semantically invalid ConstraintTemplate receives HTTP admission status `422` and is rejected before persistence.
+- An unavailable isolated validation backend receives status `503`; the admission response itself rejects the template write.
+- If the webhook call itself cannot reach Gatekeeper, the dedicated webhook's `Fail` policy rejects the ConstraintTemplate write.
+- If both Gatekeeper webhook calls are unreachable, ConstraintTemplate writes are blocked by the dedicated `Fail` policy while ordinary resources are allowed by the main webhook's `Ignore` policy.
+
+This separation keeps template compilation problems and template-backend outages from becoming a broad admission-control outage for normal workloads.
+
 ## How to Fail Closed
 
 If you installed Gatekeeper via the manifest, the only needed change is to set the `failurePolicy` field of Gatekeeper's `ValidatingWebhookConfiguration` to `Fail`. For example:

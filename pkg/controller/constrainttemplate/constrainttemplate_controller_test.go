@@ -30,6 +30,7 @@ import (
 	templatesv1 "github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/apis/templates/v1beta1"
 	constraintclient "github.com/open-policy-agent/frameworks/constraint/pkg/client"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/drivers/rego"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/client/reviews"
 	"github.com/open-policy-agent/frameworks/constraint/pkg/core/templates"
@@ -4755,4 +4756,107 @@ func Test_transformTemplateToVAP(t *testing.T) {
 		require.Contains(t, operations, admissionregistrationv1beta1.Create)
 		require.Len(t, operations, 1)
 	})
+}
+
+func TestReconcileInvalidUpdatePreservesEffectiveTemplateAndCRD(t *testing.T) {
+	const suffix = "FallbackPreserve"
+	ctx := context.Background()
+	ct := makeReconcileConstraintTemplate(suffix)
+	ct.UID = types.UID("fallback-preserve-uid")
+	ct.Generation = 7
+
+	r, trackingClient := newUnitReconciler(t, ct)
+	nn := types.NamespacedName{Name: ct.Name}
+
+	unversioned := &templates.ConstraintTemplate{}
+	require.NoError(t, r.scheme.Convert(ct, unversioned, nil))
+	_, err := r.cfClient.AddTemplate(ctx, unversioned)
+	require.NoError(t, err)
+	cstr := newDenyAllCstr(suffix)
+	_, err = r.cfClient.AddConstraint(ctx, cstr)
+	require.NoError(t, err)
+
+	proposedCRD, err := r.cfClient.CreateCRD(ctx, unversioned)
+	require.NoError(t, err)
+	currentCRD := &apiextensionsv1.CustomResourceDefinition{}
+	require.NoError(t, r.scheme.Convert(proposedCRD, currentCRD, nil))
+	currentCRD.Labels = map[string]string{"fallback-state": "effective"}
+	require.NoError(t, r.Create(ctx, currentCRD))
+
+	reviewReq := admissionv1.AdmissionRequest{
+		Kind:      metav1.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"},
+		Operation: admissionv1.Create,
+		Name:      "violating-namespace",
+		Object: runtime.RawExtension{Object: &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: "violating-namespace"},
+		}},
+	}
+	before, err := r.cfClient.Review(ctx, reviewReq, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+	require.NoError(t, err)
+	require.Len(t, before.Results(), 1)
+
+	stored := &v1beta1.ConstraintTemplate{}
+	require.NoError(t, r.Get(ctx, nn, stored))
+	stored.Spec.Targets[0].Rego = `
+package foo
+violation[{"msg": msg}] { msg := "still compiling" }
+invalid[}}}`
+	require.NoError(t, r.Update(ctx, stored))
+
+	result, reconcileErr := r.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+	require.Error(t, reconcileErr)
+	require.Equal(t, reconcile.Result{}, result)
+	require.True(t, errors.Is(reconcileErr, reconcile.TerminalError(errors.New("terminal"))),
+		"invalid template errors must be terminal, got %T: %v", reconcileErr, reconcileErr)
+
+	statusName, err := statusv1beta1.KeyForConstraintTemplate("test-pod", ct.GetName())
+	require.NoError(t, err)
+	podStatus := &statusv1beta1.ConstraintTemplatePodStatus{}
+	require.NoError(t, trackingClient.Get(ctx, types.NamespacedName{Name: statusName, Namespace: util.GetNamespace()}, podStatus))
+	require.Equal(t, ct.UID, podStatus.Status.TemplateUID)
+	require.Equal(t, int64(7), podStatus.Status.ObservedGeneration)
+	require.Len(t, podStatus.Status.Errors, 1)
+	require.Equal(t, ErrIngestCode, podStatus.Status.Errors[0].Code)
+	require.Contains(t, podStatus.Status.Errors[0].Message, "[Invalid/TemplateInvalidRego]")
+
+	preservedCRD := &apiextensionsv1.CustomResourceDefinition{}
+	require.NoError(t, trackingClient.Get(ctx, types.NamespacedName{Name: currentCRD.Name}, preservedCRD))
+	require.Equal(t, "effective", preservedCRD.Labels["fallback-state"])
+
+	after, err := r.cfClient.Review(ctx, reviewReq, reviews.EnforcementPoint(util.AuditEnforcementPoint))
+	require.NoError(t, err)
+	require.Len(t, after.Results(), 1, "last effective template must continue enforcing after invalid update")
+}
+
+type uid2RetryableTemplateDriver struct {
+	drivers.Driver
+}
+
+func (d *uid2RetryableTemplateDriver) Name() string { return "retryable-template-driver" }
+
+func (d *uid2RetryableTemplateDriver) AddTemplate(context.Context, *templates.ConstraintTemplate) error {
+	return apierrors.NewServiceUnavailable("compile backend unavailable")
+}
+
+func TestReconcileRetryableTemplateErrorIsReturnedForBackoff(t *testing.T) {
+	ctx := context.Background()
+	ct := makeReconcileConstraintTemplate("RetryableFallback")
+	ct.Spec.Targets[0].Rego = ""
+	ct.Spec.Targets[0].Code = []v1beta1.Code{{
+		Engine: "retryable-template-driver",
+		Source: &templates.Anything{Value: map[string]any{}},
+	}}
+	r, _ := newUnitReconciler(t, ct)
+	retryableClient, err := constraintclient.NewClient(
+		constraintclient.Targets(&target.K8sValidationTarget{}),
+		constraintclient.Driver(&uid2RetryableTemplateDriver{}),
+		constraintclient.EnforcementPoints(util.AuditEnforcementPoint),
+	)
+	require.NoError(t, err)
+	r.cfClient = retryableClient
+
+	result, reconcileErr := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: ct.Name}})
+	require.Error(t, reconcileErr)
+	require.True(t, apierrors.IsServiceUnavailable(reconcileErr), "got %T: %v", reconcileErr, reconcileErr)
+	require.Equal(t, reconcile.Result{}, result)
 }
